@@ -56,6 +56,13 @@ class _Pending:
     sent_at: float = field(default_factory=time.time)
 
 
+@dataclass
+class PendingRequest:
+    id: int
+    queue: queue.Queue
+    method: str
+
+
 def resolve_codex_binary(codex_bin: str = "codex") -> str:
     """Return an executable path for Codex.
 
@@ -231,18 +238,42 @@ class CodexAppServerClient:
     ) -> dict:
         """Send a JSON-RPC request and block on the response. Returns `result`,
         raises CodexAppServerError on `error`."""
+        pending = self.begin_request(method, params)
+        return self.await_request(pending, timeout=timeout)
+
+    def begin_request(
+        self,
+        method: str,
+        params: Optional[dict] = None,
+    ) -> PendingRequest:
+        """Send a JSON-RPC request and return a handle that can be polled.
+
+        Used for long-running methods like `turn/start` where Codex may write
+        authoritative completion state to its session log before the JSON-RPC
+        response is observed by this client.
+        """
         rid = self._take_id()
         q: queue.Queue = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[rid] = _Pending(queue=q, method=method)
         self._send({"id": rid, "method": method, "params": params or {}})
+        return PendingRequest(id=rid, queue=q, method=method)
+
+    def await_request(
+        self,
+        pending: PendingRequest,
+        timeout: float = 30.0,
+        *,
+        cancel_on_timeout: bool = True,
+    ) -> dict:
+        """Wait for a request handle created by begin_request()."""
         try:
-            msg = q.get(timeout=timeout)
+            msg = pending.queue.get(timeout=timeout)
         except queue.Empty:
-            with self._pending_lock:
-                self._pending.pop(rid, None)
+            if cancel_on_timeout:
+                self.cancel_request(pending)
             raise TimeoutError(
-                f"codex app-server method {method!r} timed out after {timeout}s"
+                f"codex app-server method {pending.method!r} timed out after {timeout}s"
             )
         if "error" in msg:
             err = msg["error"]
@@ -252,6 +283,10 @@ class CodexAppServerClient:
                 data=err.get("data"),
             )
         return msg.get("result", {})
+
+    def cancel_request(self, pending: PendingRequest) -> None:
+        with self._pending_lock:
+            self._pending.pop(pending.id, None)
 
     def notify(self, method: str, params: Optional[dict] = None) -> None:
         """Send a JSON-RPC notification (no id, no response expected)."""

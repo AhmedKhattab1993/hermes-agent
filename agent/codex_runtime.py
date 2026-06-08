@@ -41,7 +41,12 @@ def run_codex_app_server_turn(
     Called from run_conversation() when agent.api_mode == "codex_app_server".
     Returns the same dict shape as the chat_completions path.
     """
-    from agent.transports.codex_app_server_session import CodexAppServerSession
+    from agent.transports.codex_app_server_session import (
+        CodexAppServerSession,
+        _CodexSessionLogTailer,
+        _ensure_final_text_projected,
+        _poll_session_log_for_completion,
+    )
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
@@ -88,6 +93,35 @@ def run_codex_app_server_turn(
             "error": str(exc),
         }
 
+    if not turn.final_text and turn.thread_id:
+        try:
+            log_tailer = _CodexSessionLogTailer(
+                codex_home=None,
+                thread_id=turn.thread_id,
+                find_interval=0,
+            )
+            log_update = _poll_session_log_for_completion(
+                log_tailer,
+                turn.turn_id,
+                timeout=2.0,
+            )
+            if log_update.turn_id and not turn.turn_id:
+                turn.turn_id = log_update.turn_id
+            if log_update.final_text:
+                turn.final_text = log_update.final_text
+                _ensure_final_text_projected(turn)
+                logger.info(
+                    "codex app-server runtime hydrated final text from "
+                    "session log: thread=%s turn=%s",
+                    turn.thread_id[:8],
+                    (turn.turn_id or "")[:8],
+                )
+        except Exception:
+            logger.debug("codex session-log hydration failed", exc_info=True)
+
+    if turn.final_text:
+        _ensure_final_text_projected(turn)
+
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
     # exited), retire the session so the next turn respawns codex
@@ -107,8 +141,21 @@ def run_codex_app_server_turn(
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
-    if turn.projected_messages:
-        messages.extend(turn.projected_messages)
+    pre_projection_messages = list(messages)
+    projected_messages = list(turn.projected_messages or [])
+    if (
+        projected_messages
+        and pre_projection_messages
+        and pre_projection_messages[-1].get("role") == "user"
+        and projected_messages[0].get("role") == "user"
+        and pre_projection_messages[-1].get("content")
+        == projected_messages[0].get("content")
+    ):
+        projected_messages = projected_messages[1:]
+    if projected_messages:
+        messages.extend(projected_messages)
+
+    agent._persist_session(messages, pre_projection_messages)
 
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented

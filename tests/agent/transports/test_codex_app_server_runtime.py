@@ -7,8 +7,11 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from agent.codex_runtime import run_codex_app_server_turn
 from hermes_cli.runtime_provider import (
     _VALID_API_MODES,
     _maybe_apply_codex_app_server_runtime,
@@ -167,6 +170,129 @@ class TestCodexAppServerModule:
         assert isinstance(err, RuntimeError)
         assert "boom" in str(err)
         assert "-32600" in str(err)
+
+
+class TestCodexRuntimeProjection:
+    def test_projected_user_message_is_not_duplicated(
+        self,
+        monkeypatch,
+    ) -> None:
+        from agent.transports import codex_app_server_session as session_mod
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                pass
+
+            def run_turn(self, user_input):
+                return SimpleNamespace(
+                    final_text="runtime final",
+                    projected_messages=[
+                        {"role": "user", "content": "hello"},
+                        {"role": "assistant", "content": "runtime final"},
+                    ],
+                    tool_iterations=0,
+                    interrupted=False,
+                    error=None,
+                    should_retire=False,
+                    thread_id="thread-1",
+                    turn_id="turn-1",
+                )
+
+        monkeypatch.setattr(session_mod, "CodexAppServerSession", FakeSession)
+        persisted = []
+        agent = SimpleNamespace(
+            _codex_session=None,
+            session_cwd="/tmp",
+            _iters_since_skill=0,
+            _skill_nudge_interval=0,
+            valid_tool_names=set(),
+            _sync_external_memory_for_turn=lambda **kwargs: None,
+            _persist_session=lambda persisted_messages, conversation_history=None: persisted.append(
+                (list(persisted_messages), conversation_history)
+            ),
+        )
+        messages = [{"role": "user", "content": "hello"}]
+
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=messages,
+            effective_task_id="task-1",
+        )
+
+        assert result["messages"] == [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "runtime final"},
+        ]
+        assert persisted == [
+            (
+                [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "runtime final"},
+                ],
+                [{"role": "user", "content": "hello"}],
+            )
+        ]
+
+    def test_final_text_is_projected_when_notifications_did_not_project_message(
+        self,
+        monkeypatch,
+    ) -> None:
+        from agent.transports import codex_app_server_session as session_mod
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                pass
+
+            def run_turn(self, user_input):
+                return SimpleNamespace(
+                    final_text="runtime final",
+                    projected_messages=[],
+                    tool_iterations=0,
+                    interrupted=False,
+                    error=None,
+                    should_retire=False,
+                    thread_id="thread-1",
+                    turn_id="turn-1",
+                )
+
+        monkeypatch.setattr(session_mod, "CodexAppServerSession", FakeSession)
+        persisted = []
+        agent = SimpleNamespace(
+            _codex_session=None,
+            session_cwd="/tmp",
+            _iters_since_skill=0,
+            _skill_nudge_interval=0,
+            valid_tool_names=set(),
+            _sync_external_memory_for_turn=lambda **kwargs: None,
+            _persist_session=lambda persisted_messages, conversation_history=None: persisted.append(
+                (list(persisted_messages), conversation_history)
+            ),
+        )
+        messages = [{"role": "user", "content": "hello"}]
+
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=messages,
+            effective_task_id="task-1",
+        )
+
+        assert result["final_response"] == "runtime final"
+        assert {"role": "assistant", "content": "runtime final"} in result[
+            "messages"
+        ]
+        assert persisted == [
+            (
+                [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "runtime final"},
+                ],
+                [{"role": "user", "content": "hello"}],
+            )
+        ]
 
 
 class TestSpawnEnvIsolation:

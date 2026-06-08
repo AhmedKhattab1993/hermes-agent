@@ -7,6 +7,10 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import json
+import itertools
+from datetime import datetime, timezone
+from pathlib import Path
 import time
 from unittest.mock import patch
 from typing import Any, Optional
@@ -38,6 +42,8 @@ class FakeClient:
         self._notifications: list[dict] = []
         self._server_requests: list[dict] = []
         self._request_handler = None  # Optional[Callable[[str, dict], dict]]
+        self._pending: dict[int, tuple[str, dict]] = {}
+        self._next_id = 1
 
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
@@ -54,10 +60,30 @@ class FakeClient:
             return {"thread": {"id": "thread-fake-001"},
                     "activePermissionProfile": {"id": "workspace-write"}}
         if method == "turn/start":
-            return {"turn": {"id": "turn-fake-001"}}
+            return {"turnId": "turn-fake-001"}
         if method == "turn/interrupt":
             return {}
         return {}
+
+    def begin_request(self, method: str, params: Optional[dict] = None):
+        self.requests.append((method, params or {}))
+        rid = self._next_id
+        self._next_id += 1
+        self._pending[rid] = (method, params or {})
+        return type("Pending", (), {"id": rid, "method": method})()
+
+    def await_request(self, pending, timeout: float = 30.0, *, cancel_on_timeout: bool = True):
+        if pending.id not in self._pending:
+            raise TimeoutError("pending request cancelled")
+        method, params = self._pending.pop(pending.id)
+        if self._request_handler is not None:
+            return self._request_handler(method, params)
+        if method == "turn/start":
+            return {"turnId": "turn-fake-001"}
+        return self.request(method, params, timeout=timeout)
+
+    def cancel_request(self, pending) -> None:
+        self._pending.pop(pending.id, None)
 
     def notify(self, method: str, params=None):
         pass
@@ -111,6 +137,31 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
         client_factory=lambda **kw: client,
         **kwargs,
     )
+
+
+def write_codex_session_log(codex_home: Path, thread_id: str, *records: dict) -> Path:
+    path = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "06"
+        / "08"
+        / f"rollout-2026-06-08T00-00-00-{thread_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record))
+            fh.write("\n")
+    return path
+
+
+def codex_log_record(record_type: str, payload: dict) -> dict:
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "type": record_type,
+        "payload": payload,
+    }
 
 
 # ---- choice mapping ----
@@ -386,7 +437,7 @@ class TestRunTurn:
     def test_deadline_uses_monotonic_clock(self):
         client = FakeClient()
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 1001.0])
+        monotonic_values = iter([1000.0, 1000.0, 999.0, 999.0, 1001.0])
         with patch.object(
             session_mod.time,
             "monotonic",
@@ -410,6 +461,221 @@ class TestRunTurn:
         s = make_session(client)
         r = s.run_turn("x", turn_timeout=1.0)
         assert r.error and "model error" in r.error
+
+    def test_session_log_task_complete_finishes_silent_turn(self, tmp_path):
+        client = FakeClient()
+        write_codex_session_log(
+            tmp_path,
+            "thread-fake-001",
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-fake-001",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "hello from session log",
+                    "phase": "final_answer",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-fake-001",
+                    "last_agent_message": "hello from session log",
+                },
+            },
+        )
+        s = make_session(client, codex_home=str(tmp_path))
+        r = s.run_turn(
+            "hi",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.01,
+        )
+        assert r.error is None
+        assert r.interrupted is False
+        assert r.final_text == "hello from session log"
+        assert {"role": "assistant", "content": "hello from session log"} in (
+            r.projected_messages
+        )
+
+    def test_new_session_log_completion_finishes_before_turn_start_ack(
+        self,
+        tmp_path,
+    ):
+        client = FakeClient()
+        wrote_log = False
+
+        def await_request_timeout(pending, timeout=30.0, *, cancel_on_timeout=True):
+            nonlocal wrote_log
+            if not wrote_log:
+                wrote_log = True
+                write_codex_session_log(
+                    tmp_path,
+                    "thread-fake-001",
+                    codex_log_record(
+                        "turn_context",
+                        {"turn_id": "turn-fast-log-001"},
+                    ),
+                    codex_log_record(
+                        "response_item",
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "completed before ack",
+                                }
+                            ],
+                        },
+                    ),
+                    codex_log_record(
+                        "event_msg",
+                        {
+                            "type": "task_complete",
+                            "turn_id": "turn-fast-log-001",
+                            "last_agent_message": "completed before ack",
+                        },
+                    ),
+                )
+            raise TimeoutError("turn/start not acknowledged yet")
+
+        client.await_request = await_request_timeout
+        s = make_session(client, codex_home=str(tmp_path))
+        r = s.run_turn(
+            "hi",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.01,
+        )
+        assert r.error is None
+        assert r.interrupted is False
+        assert r.turn_id == "turn-fast-log-001"
+        assert r.final_text == "completed before ack"
+        assert {"role": "assistant", "content": "completed before ack"} in (
+            r.projected_messages
+        )
+
+    def test_turn_completed_without_agent_item_uses_session_log(self, tmp_path):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        write_codex_session_log(
+            tmp_path,
+            "thread-fake-001",
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn-fake-001",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-fake-001",
+                    "last_agent_message": "terminal log text",
+                },
+            },
+        )
+        s = make_session(client, codex_home=str(tmp_path))
+        r = s.run_turn(
+            "hi",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.01,
+        )
+        assert r.error is None
+        assert r.final_text == "terminal log text"
+        assert {"role": "assistant", "content": "terminal log text"} in (
+            r.projected_messages
+        )
+
+    def test_session_log_response_item_supplies_final_text(self, tmp_path):
+        client = FakeClient()
+        write_codex_session_log(
+            tmp_path,
+            "thread-fake-001",
+            {
+                "type": "turn_context",
+                "payload": {"turn_id": "turn-fake-001"},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "from response item"}
+                    ],
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-fake-001",
+                },
+            },
+        )
+        s = make_session(client, codex_home=str(tmp_path))
+        r = s.run_turn(
+            "hi",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.01,
+        )
+        assert r.error is None
+        assert r.final_text == "from response item"
+        assert {"role": "assistant", "content": "from response item"} in (
+            r.projected_messages
+        )
+
+    def test_session_log_ignores_other_turn_completion(self, tmp_path):
+        client = FakeClient()
+        write_codex_session_log(
+            tmp_path,
+            "thread-fake-001",
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "some-other-turn",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "wrong turn",
+                    "phase": "final_answer",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "some-other-turn",
+                    "last_agent_message": "wrong turn",
+                },
+            },
+        )
+        s = make_session(client, codex_home=str(tmp_path))
+        r = s.run_turn(
+            "hi",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+        )
+        assert r.interrupted is True
+        assert r.final_text == ""
+        assert r.error and "timed out" in r.error
 
 
 # ---- approval bridge ----
@@ -735,7 +1001,10 @@ class TestSessionRetirement:
             threadId="t", turnId="tu1",
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
+        monotonic_values = itertools.chain(
+            [1000.0, 1000.0, 999.0, 999.0, 999.0, 1000.2],
+            itertools.repeat(1000.4),
+        )
         with patch.object(
             session_mod.time,
             "monotonic",

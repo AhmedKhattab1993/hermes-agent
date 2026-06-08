@@ -25,10 +25,13 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
@@ -183,6 +186,188 @@ class _ServerRequestRouting:
 
     auto_approve_exec: bool = False
     auto_approve_apply_patch: bool = False
+
+
+@dataclass
+class _CodexSessionLogUpdate:
+    final_text: Optional[str] = None
+    completed: bool = False
+    turn_id: Optional[str] = None
+
+
+class _CodexSessionLogTailer:
+    """Read Codex's session JSONL as the authoritative turn-completion log.
+
+    Codex app-server builds can complete a turn in the session log without
+    emitting the older `item/completed` + `turn/completed` notifications. This
+    tailer keeps Hermes from waiting for a notification stream that is silent.
+    """
+
+    def __init__(
+        self,
+        *,
+        codex_home: Optional[str],
+        thread_id: str,
+        find_interval: float = 0.25,
+        start_at_end: bool = False,
+        not_before_epoch: Optional[float] = None,
+    ) -> None:
+        home = codex_home or os.environ.get("CODEX_HOME") or "~/.codex"
+        self._sessions_dir = Path(home).expanduser() / "sessions"
+        self._thread_id = thread_id
+        self._find_interval = find_interval
+        self._start_at_end = start_at_end
+        self._path: Optional[Path] = None
+        self._offset = 0
+        self._last_find_at = 0.0
+        self._active_turn_ids: set[str] = set()
+        self._primed = False
+        self._not_before_epoch = not_before_epoch
+
+    def prime(self) -> None:
+        self._resolve_path()
+
+    def poll(self, turn_id: Optional[str]) -> _CodexSessionLogUpdate:
+        if turn_id is not None and not turn_id:
+            return _CodexSessionLogUpdate()
+        path = self._resolve_path()
+        if path is None:
+            return _CodexSessionLogUpdate()
+        try:
+            size = path.stat().st_size
+        except OSError:
+            self._path = None
+            self._offset = 0
+            return _CodexSessionLogUpdate()
+        if size < self._offset:
+            self._offset = 0
+            self._active_turn_ids.clear()
+
+        update = _CodexSessionLogUpdate()
+        try:
+            with path.open("rb") as fh:
+                fh.seek(self._offset)
+                while True:
+                    line_start = fh.tell()
+                    raw_line = fh.readline()
+                    if not raw_line:
+                        break
+                    try:
+                        record = json.loads(raw_line.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        self._offset = line_start
+                        break
+                    self._offset = fh.tell()
+                    self._apply_record(record, turn_id, update)
+        except OSError:
+            self._path = None
+            self._offset = 0
+        return update
+
+    def _resolve_path(self) -> Optional[Path]:
+        if self._path is not None:
+            return self._path
+        now = time.monotonic()
+        if now - self._last_find_at < self._find_interval:
+            return None
+        self._last_find_at = now
+        if not self._sessions_dir.exists():
+            return None
+        matches = list(
+            self._sessions_dir.glob(f"**/rollout-*-{self._thread_id}.jsonl")
+        )
+        if not matches:
+            return None
+        self._path = max(matches, key=lambda p: p.stat().st_mtime)
+        if self._start_at_end and not self._primed:
+            try:
+                self._offset = self._path.stat().st_size
+            except OSError:
+                self._offset = 0
+            self._primed = True
+        return self._path
+
+    def _apply_record(
+        self,
+        record: dict,
+        turn_id: Optional[str],
+        update: _CodexSessionLogUpdate,
+    ) -> None:
+        if not self._is_recent_enough(record):
+            return
+
+        payload = record.get("payload") or {}
+        if not isinstance(payload, dict):
+            return
+
+        record_type = record.get("type")
+        payload_turn_id = payload.get("turn_id")
+        if record_type == "turn_context" and (
+            payload_turn_id == turn_id or turn_id is None
+        ):
+            if isinstance(payload_turn_id, str):
+                self._active_turn_ids.add(payload_turn_id)
+            return
+
+        if record_type == "event_msg":
+            event_type = payload.get("type")
+            if event_type == "task_started" and (
+                payload_turn_id == turn_id or turn_id is None
+            ):
+                if isinstance(payload_turn_id, str):
+                    self._active_turn_ids.add(payload_turn_id)
+                    update.turn_id = payload_turn_id
+                return
+            if event_type == "agent_message" and (
+                (turn_id is not None and turn_id in self._active_turn_ids)
+                or (turn_id is None and bool(self._active_turn_ids))
+            ):
+                message = payload.get("message")
+                if isinstance(message, str):
+                    update.final_text = message
+                return
+            if event_type == "task_complete" and (
+                payload_turn_id == turn_id
+                or (turn_id is None and payload_turn_id in self._active_turn_ids)
+            ):
+                if isinstance(payload_turn_id, str):
+                    update.turn_id = payload_turn_id
+                message = payload.get("last_agent_message")
+                if isinstance(message, str) and message:
+                    update.final_text = message
+                update.completed = True
+                return
+
+        if record_type != "response_item":
+            return
+        if turn_id is not None and turn_id not in self._active_turn_ids:
+            return
+        if turn_id is None and not self._active_turn_ids:
+            return
+        if payload.get("type") != "message" or payload.get("role") != "assistant":
+            return
+        text_parts = []
+        for part in payload.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    text_parts.append(text)
+        if text_parts:
+            update.final_text = "\n".join(text_parts)
+
+    def _is_recent_enough(self, record: dict) -> bool:
+        if self._not_before_epoch is None:
+            return True
+        timestamp = record.get("timestamp")
+        if not isinstance(timestamp, str) or not timestamp:
+            return False
+        try:
+            record_epoch = datetime.fromisoformat(
+                timestamp.replace("Z", "+00:00")
+            ).timestamp()
+        except ValueError:
+            return False
+        return record_epoch >= self._not_before_epoch
 
 
 class CodexAppServerSession:
@@ -400,17 +585,31 @@ class CodexAppServerSession:
         projector = CodexEventProjector()
 
         user_input_text = _coerce_turn_input_text(user_input)
+        turn_start_epoch = time.time()
+
+        startup_log_tailer = _CodexSessionLogTailer(
+            codex_home=self._codex_home,
+            thread_id=self._thread_id,
+            not_before_epoch=turn_start_epoch - 2.0,
+        )
+        startup_log_tailer.prime()
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
+        turn_start_params = {
+            "threadId": self._thread_id,
+            "input": [{"type": "text", "text": user_input_text}],
+        }
         try:
-            ts = self._client.request(
+            pending_turn_start = self._client.begin_request(
                 "turn/start",
-                {
-                    "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
-                },
-                timeout=10,
+                turn_start_params,
+            )
+            ts = self._wait_for_turn_start_or_log_completion(
+                pending_turn_start,
+                startup_log_tailer,
+                result,
+                timeout=10.0,
             )
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
@@ -439,9 +638,16 @@ class CodexAppServerSession:
             result.should_retire = True
             return result
 
-        result.turn_id = (ts.get("turn") or {}).get("id")
+        if result.final_text:
+            return result
+
+        result.turn_id = _extract_turn_start_id(ts)
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
+        log_tailer = _CodexSessionLogTailer(
+            codex_home=self._codex_home,
+            thread_id=self._thread_id,
+        )
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
         # within post_tool_quiet_timeout and the turn hasn't completed, we
@@ -527,6 +733,18 @@ class CodexAppServerSession:
                 timeout=notification_poll_timeout
             )
             if note is None:
+                log_update = log_tailer.poll(result.turn_id)
+                if log_update.final_text is not None:
+                    result.final_text = log_update.final_text
+                if log_update.completed:
+                    turn_complete = True
+                    _ensure_final_text_projected(result)
+                    logger.info(
+                        "codex app-server turn completed via session log: "
+                        "thread=%s turn=%s",
+                        self._thread_id[:8],
+                        (result.turn_id or "")[:8],
+                    )
                 continue
 
             method = note.get("method", "")
@@ -574,6 +792,22 @@ class CodexAppServerSession:
 
             if method == "turn/completed":
                 turn_complete = True
+                if not result.final_text:
+                    log_update = _poll_session_log_for_completion(
+                        log_tailer,
+                        result.turn_id,
+                        timeout=2.0,
+                    )
+                    if log_update.final_text is not None:
+                        result.final_text = log_update.final_text
+                    if log_update.completed:
+                        _ensure_final_text_projected(result)
+                        logger.info(
+                            "codex app-server turn completed via session log: "
+                            "thread=%s turn=%s",
+                            self._thread_id[:8],
+                            (result.turn_id or "")[:8],
+                        )
                 turn_status = (
                     (note.get("params") or {}).get("turn") or {}
                 ).get("status")
@@ -614,6 +848,55 @@ class CodexAppServerSession:
         return result
 
     # ---------- internals ----------
+
+    def _wait_for_turn_start_or_log_completion(
+        self,
+        pending_turn_start: Any,
+        log_tailer: _CodexSessionLogTailer,
+        result: TurnResult,
+        *,
+        timeout: float,
+    ) -> dict:
+        assert self._client is not None
+        deadline = time.monotonic() + timeout
+        last_log_update = _CodexSessionLogUpdate()
+        while time.monotonic() < deadline:
+            if not self._client.is_alive():
+                raise TimeoutError("codex app-server exited before turn/start response")
+            try:
+                return self._client.await_request(
+                    pending_turn_start,
+                    timeout=0.05,
+                    cancel_on_timeout=False,
+                )
+            except TimeoutError:
+                pass
+
+            log_update = log_tailer.poll(None)
+            if log_update.turn_id:
+                last_log_update.turn_id = log_update.turn_id
+            if log_update.final_text is not None:
+                last_log_update.final_text = log_update.final_text
+            if log_update.completed:
+                self._client.cancel_request(pending_turn_start)
+                result.turn_id = log_update.turn_id or last_log_update.turn_id
+                if log_update.final_text is not None:
+                    result.final_text = log_update.final_text
+                elif last_log_update.final_text is not None:
+                    result.final_text = last_log_update.final_text
+                _ensure_final_text_projected(result)
+                logger.info(
+                    "codex app-server turn completed via session log before "
+                    "turn/start ack: thread=%s turn=%s",
+                    self._thread_id[:8] if self._thread_id else "",
+                    (result.turn_id or "")[:8],
+                )
+                return {}
+
+        self._client.cancel_request(pending_turn_start)
+        raise TimeoutError(
+            f"codex app-server method 'turn/start' timed out after {timeout:.0f}s"
+        )
 
     def _issue_interrupt(self, turn_id: Optional[str]) -> None:
         if self._client is None or self._thread_id is None or turn_id is None:
@@ -834,6 +1117,51 @@ def _has_turn_aborted_marker(text: str) -> bool:
         if marker in text:
             return True
     return False
+
+
+def _extract_turn_start_id(payload: dict) -> Optional[str]:
+    turn_id = payload.get("turnId") or payload.get("turn_id")
+    if isinstance(turn_id, str) and turn_id:
+        return turn_id
+    turn = payload.get("turn") or {}
+    if not isinstance(turn, dict):
+        return None
+    turn_id = turn.get("id") or turn.get("turnId") or turn.get("turn_id")
+    if isinstance(turn_id, str) and turn_id:
+        return turn_id
+    return None
+
+
+def _ensure_final_text_projected(result: TurnResult) -> None:
+    if not result.final_text:
+        return
+    for msg in result.projected_messages:
+        if msg.get("role") == "assistant" and msg.get("content") == result.final_text:
+            return
+    result.projected_messages.append(
+        {"role": "assistant", "content": result.final_text}
+    )
+
+
+def _poll_session_log_for_completion(
+    log_tailer: _CodexSessionLogTailer,
+    turn_id: Optional[str],
+    *,
+    timeout: float,
+) -> _CodexSessionLogUpdate:
+    deadline = time.monotonic() + timeout
+    last_update = _CodexSessionLogUpdate()
+    while time.monotonic() <= deadline:
+        update = log_tailer.poll(turn_id)
+        if update.turn_id:
+            last_update.turn_id = update.turn_id
+        if update.final_text is not None:
+            last_update.final_text = update.final_text
+        if update.completed:
+            last_update.completed = True
+            return last_update
+        time.sleep(0.05)
+    return last_update
 
 
 def _get_hermes_version() -> str:
